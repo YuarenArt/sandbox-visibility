@@ -1,0 +1,237 @@
+#!/usr/bin/env bpftrace
+/*
+ * Наблюдатель на хосте, канал C1: точки трассировки системных вызовов.
+ *
+ * $1 это собственный pid, переданный обвязкой. Без него наблюдатель считает
+ * собственный вывод: он печатает строку с маркером обычной записью, та снова
+ * попадает под пробу, и в измеренном прогоне 235 событий из 367 оказались его
+ * собственными.
+ *
+ * Отбор идёт по содержимому аргумента, а не по имени процесса: шаблон по comm
+ * не ловит ни vring_worker, ни fc_vcpu, а qemu-system-x86_64 ядро обрезает до
+ * 15 символов. comm только записывается.
+ *
+ * Каждая строка несёт и точное имя системного вызова, и метку логической
+ * операции op=. Разделять вызовы обязательно: сложение unlink с unlinkat по
+ * подстроке делало строки несравнимыми. Но и сравнивать строки по именам
+ * вызовов нельзя: одно и то же удаление приходит на хост как unlink от glibc и
+ * как unlinkat от Sentry. Сравнение ведётся по op=, разбивка по именам вызовов
+ * приводится рядом.
+ *
+ * Счётчики раздельные. Один общий скаляр был бы суммой разнотипных колонок,
+ * то есть величиной, которая не значит ничего.
+ */
+
+BEGIN
+{
+	printf("TRACE-READY selfpid=%d nsecs=%lld\n", $1, nsecs);
+}
+
+/*
+ * Устаревший open обязателен. Firecracker открывает образ и ядро именно им, и
+ * без этой пробы внутренний контроль живости у его строки давал ноль при
+ * трассировщике, видевшем от него же 3182 вызова.
+ */
+tracepoint:syscalls:sys_enter_open
+/pid != $1 && strcontains(str(args.filename), "SVP-")/
+{
+	printf("EVT %lld %s %d open op=open %s\n", nsecs, comm, pid,
+	       str(args.filename));
+	@n_open = count();
+}
+
+tracepoint:syscalls:sys_enter_openat
+/pid != $1 && strcontains(str(args.filename), "SVP-")/
+{
+	printf("EVT %lld %s %d openat op=open %s\n", nsecs, comm, pid,
+	       str(args.filename));
+	@n_open = count();
+}
+
+tracepoint:syscalls:sys_enter_openat2
+/pid != $1 && strcontains(str(args.filename), "SVP-")/
+{
+	printf("EVT %lld %s %d openat2 op=open %s\n", nsecs, comm, pid,
+	       str(args.filename));
+	@n_open = count();
+}
+
+tracepoint:syscalls:sys_enter_unlink
+/pid != $1 && strcontains(str(args.pathname), "SVP-")/
+{
+	printf("EVT %lld %s %d unlink op=unlink %s\n", nsecs, comm, pid,
+	       str(args.pathname));
+	@n_unlink = count();
+}
+
+tracepoint:syscalls:sys_enter_unlinkat
+/pid != $1 && strcontains(str(args.pathname), "SVP-")/
+{
+	printf("EVT %lld %s %d unlinkat op=unlink %s\n", nsecs, comm, pid,
+	       str(args.pathname));
+	@n_unlink = count();
+}
+
+tracepoint:syscalls:sys_enter_execve
+/pid != $1 && strcontains(str(args.filename), "SVP-")/
+{
+	printf("EVT %lld %s %d execve op=exec %s\n", nsecs, comm, pid,
+	       str(args.filename));
+	@n_exec = count();
+}
+
+tracepoint:syscalls:sys_enter_execveat
+/pid != $1 && strcontains(str(args.filename), "SVP-")/
+{
+	printf("EVT %lld %s %d execveat op=exec %s\n", nsecs, comm, pid,
+	       str(args.filename));
+	@n_exec = count();
+}
+
+/*
+ * Отбор по префиксу, а не по вхождению: генератор пишет свою истину в файл, и
+ * каждая её строка содержит токен. При отборе по вхождению файл истины сам
+ * попадал бы в измерение и давал шестьдесят лишних записей на десять настоящих.
+ *
+ * Сравнение делается strncmp, а НЕ str(args.buf, 4) == "SVP-". Проверено
+ * замером run/diag-write-probe.sh: форма с равенством ловит ноль событий из
+ * восьмидесяти, потому что str() читает n байт вместе с завершающим нулём и
+ * возвращает "SVP". Колонка при этом пуста систематически, и причина не имеет
+ * отношения к границе песочницы.
+ *
+ * Тем же замером установлено, что WARNING про адресные пространства на этой
+ * пробе есть во всех формах, включая ту, что ловит все восемьдесят событий:
+ * это шум, а не отказ, и uptr() на результат не влияет.
+ */
+tracepoint:syscalls:sys_enter_write
+/pid != $1 && args.count > 4 && args.count < 4096 &&
+ strncmp(str(args.buf, 8), "SVP-", 4) == 0/
+{
+	printf("EVT %lld %s %d write op=write %s\n", nsecs, comm, pid,
+	       str(args.buf, 96));
+	@n_write = count();
+}
+
+/*
+ * У connect нет текстового аргумента, поэтому операция опознаётся по порту
+ * назначения. Порт читается байтами, чтобы не зависеть от наличия описания
+ * struct sockaddr_in в BTF. Без этой пробы сетевая колонка давала бы ноль во
+ * всех строках, включая положительный контроль, и читалось бы это как
+ * «сеть не видна нигде».
+ */
+tracepoint:syscalls:sys_enter_connect
+/pid != $1 && args.uservaddr != 0/
+{
+	$b = (uint8 *)uptr(args.uservaddr);
+	$port = (uint64)(*($b + 2)) * 256 + (uint64)(*($b + 3));
+	if ($port >= $2 && $port < $2 + 10) {
+		printf("EVT %lld %s %d connect op=connect port=%d\n", nsecs,
+		       comm, pid, $port);
+		@n_connect = count();
+	}
+}
+
+/*
+ * Содержимое уходит не только через write. Замером установлено, что virtiofsd
+ * пишет через pwritev (215 вызовов у vring_worker за прогон), поэтому ноль в
+ * колонке write без этих проб означал бы отсутствие пробы, а не отсутствие
+ * данных на хосте.
+ */
+tracepoint:syscalls:sys_enter_pwrite64
+/pid != $1 && args.count > 4 && args.count < 4096 &&
+ strncmp(str(args.buf, 8), "SVP-", 4) == 0/
+{
+	printf("EVT %lld %s %d pwrite64 op=write %s\n", nsecs, comm, pid,
+	       str(args.buf, 96));
+	@n_write = count();
+}
+
+tracepoint:syscalls:sys_enter_writev
+/pid != $1 && args.vlen > 0/
+{
+	$iov = (struct iovec *)uptr(args.vec);
+	if (strncmp(str($iov->iov_base, 8), "SVP-", 4) == 0) {
+		printf("EVT %lld %s %d writev op=write %s\n", nsecs, comm, pid,
+		       str($iov->iov_base, 96));
+		@n_write = count();
+	}
+}
+
+tracepoint:syscalls:sys_enter_pwritev
+/pid != $1 && args.vlen > 0/
+{
+	$iov = (struct iovec *)uptr(args.vec);
+	if (strncmp(str($iov->iov_base, 8), "SVP-", 4) == 0) {
+		printf("EVT %lld %s %d pwritev op=write %s\n", nsecs, comm, pid,
+		       str($iov->iov_base, 96));
+		@n_write = count();
+	}
+}
+
+/*
+ * Учёт семейства записи без всякого отбора. Нужен, чтобы отличить «содержимое
+ * не пересекает границу» от «проба стоит не на том вызове»: ноль в колонке
+ * write при непустой строке vring_worker здесь означает, что писали другим
+ * вызовом, и вывод про содержимое делать нельзя.
+ */
+tracepoint:syscalls:sys_enter_write    { @wr_family[comm, "write"] = count(); }
+tracepoint:syscalls:sys_enter_pwrite64 { @wr_family[comm, "pwrite64"] = count(); }
+tracepoint:syscalls:sys_enter_writev   { @wr_family[comm, "writev"] = count(); }
+tracepoint:syscalls:sys_enter_pwritev  { @wr_family[comm, "pwritev"] = count(); }
+tracepoint:syscalls:sys_enter_pwritev2 { @wr_family[comm, "pwritev2"] = count(); }
+
+/*
+ * Канал C2: жизненный цикл процессов. Ловится независимо от аргументов и потому
+ * работает там, где имена до хоста не доходят.
+ */
+tracepoint:sched:sched_process_exec
+{
+	@exec_by_comm[comm] = count();
+	if (strcontains(str(args.filename), "SVP-")) {
+		printf("EVT %lld %s %d sched_exec op=exec %s\n", nsecs, comm,
+		       pid, str(args.filename));
+		@n_sched_exec = count();
+	}
+}
+
+tracepoint:sched:sched_process_fork
+{
+	@fork_by_comm[str(args.parent_comm)] = count();
+}
+
+/*
+ * Нефильтрованный учёт: строка с нулём маркеров и десятками тысяч событий у
+ * монитора виртуальной машины доказывает, что трассировщик был жив. Строка с
+ * нулём и там, и там доказывает обратное. Карты печатаются целиком: обрезание
+ * до верхушки убивало это доказательство ровно на загруженной машине, где оно
+ * и нужно.
+ */
+tracepoint:raw_syscalls:sys_enter
+{
+	@all_by_comm[comm] = count();
+}
+
+END
+{
+	printf("TRACE-END nsecs=%lld\n", nsecs);
+	print(@n_open);
+	print(@n_write);
+	print(@n_unlink);
+	print(@n_exec);
+	print(@n_connect);
+	print(@n_sched_exec);
+	print(@wr_family);
+	print(@all_by_comm);
+	print(@exec_by_comm);
+	print(@fork_by_comm);
+	clear(@n_open);
+	clear(@n_write);
+	clear(@n_unlink);
+	clear(@n_exec);
+	clear(@n_connect);
+	clear(@n_sched_exec);
+	clear(@wr_family);
+	clear(@all_by_comm);
+	clear(@exec_by_comm);
+	clear(@fork_by_comm);
+}
