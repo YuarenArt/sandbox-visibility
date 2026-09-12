@@ -1,28 +1,27 @@
 #!/bin/bash
-# Сводка по результатам. Считает полноту по каждому типу операции отдельно и
-# приводит минимум, медиану и максимум по повторам.
-#
-# Общего числа «маркеров» здесь нет намеренно: в первом заходе именно оно
-# оказалось суммой трёх разнотипных колонок и выдавалось за меру видимости.
 set -u
 
 S="$(cd "$(dirname "$0")" && pwd)"
-OUT="${1:-$S/results}"
+# Sessions write to results/<timestamp>; the bare default has to follow the
+# symlink, otherwise this reads whatever old session sits directly in results/.
+OUT="${1:-$S/results/latest}"
 
 if [ ! -d "$OUT" ]; then
-    echo "нет каталога результатов: $OUT" >&2
+    echo "no results directory: $OUT" >&2
     exit 1
 fi
 
 envs="host sham gvisor-overlay gvisor-directfs gvisor-gofer qemu-block qemu-virtiofs firecracker-block"
 
-# min/median/max по списку чисел на входе.
+# Must match REPS in src/gen.c and the listener port range in run/common.sh.
+OPS_PER_RUN=10
+
 stats() {
     sort -n | {
         vals=$(cat)
         n=$(echo "$vals" | grep -c .)
         if [ "$n" = "0" ]; then
-            echo "нет"
+            echo "no"
             return
         fi
         mn=$(echo "$vals" | head -1)
@@ -36,8 +35,10 @@ stats() {
     }
 }
 
-# Полнота по типу операции: сколько различных токенов этого типа, записанных
-# генератором как успешные, встретилось в трейсе.
+# A token is counted only when it appears in an event of its own operation.
+# Matching the token anywhere in the trace conflates operations: open and unlink
+# share one token by design, and the exec token also shows up as the openat
+# argument of the copy that precedes execve.
 recall_for() {
     local trace=$1 truth=$2 op=$3
     local seen=0 total=0 tok
@@ -45,76 +46,97 @@ recall_for() {
     while read -r tok; do
         [ -n "$tok" ] || continue
         total=$((total + 1))
-        # -a обязателен: в трейс попадают нулевые байты, grep считает файл
-        # двоичным и молча ничего не выводит, а таблица выходит пустой без
-        # объяснения причины.
-        if grep -qa -- "$tok" "$trace" 2>/dev/null; then
+        # -a is required: traces contain NUL bytes and grep would treat the
+        # file as binary and print nothing.
+        if grep -qa -- " op=$op .*$tok" "$trace" 2>/dev/null; then
             seen=$((seen + 1))
         fi
     done <<EOF
-$(grep "^op=$op " "$truth" 2>/dev/null | grep ' rc=0\| rc=[1-9]' | \
-  grep -v 'tok=NOT-INSTRUMENTED' | sed 's/.*tok=//; s/ .*//' | sort -u)
+$(grep -a "^op=$op " "$truth" 2>/dev/null | grep -a ' rc=0\| rc=[1-9]' |
+  grep -av 'tok=NOT-INSTRUMENTED' | sed 's/.*tok=//; s/ .*//' | sort -u)
 EOF
     [ "$total" = "0" ] && { echo ""; return; }
-
-    # Знаменатель обязан совпадать с тем, что генератор сам объявил успешным.
-    # Расхождение означает частичную истину, а на ней полнота выглядит лучше
-    # настоящей: делится на меньшее число. Такую строку надо пометить, а не
-    # молча посчитать.
-    local declared
-    declared=$(grep -a "^denom $op " "$truth" 2>/dev/null | sed 's/.*succeeded=//')
-    if [ -n "$declared" ] && [ "$declared" != "$total" ]; then
-        echo "$seen/$total!"
-        return
-    fi
     echo "$seen/$total"
 }
 
-printf '%-18s %-10s %-9s %-9s %-9s %-9s %-9s\n' \
-    среда повторов open write unlink exec connect
-printf '%s\n' "--------------------------------------------------------------------------------"
+# connect carries no textual token, so it is matched by destination port.
+# Counted as distinct ports, not as events, to stay comparable with the other
+# columns. Foreign traffic to the same port range would still be counted.
+recall_connect() {
+    local trace=$1 truth=$2
+    local declared seen
+    declared=$(grep -a '^denom connect ' "$truth" 2>/dev/null | sed 's/.*succeeded=//')
+    [ -n "$declared" ] || { echo ""; return; }
+    seen=$(grep -oa 'port=[0-9]*' "$trace" 2>/dev/null | sort -u | grep -c . || true)
+    echo "${seen:-0}/$declared"
+}
+
+printf '%-18s %-9s %-9s %-9s %-9s %-9s %-9s\n' \
+    env runs open write unlink exec connect
+printf '%s\n' "------------------------------------------------------------------------"
 
 for env in $envs; do
-    reps=0; invalid=0; partial=0
+    reps=0; bad=0; partial=0
     o=""; w=""; u=""; e=""; c=""
-
-    # Расхождение знаменателя с объявленным генератором означает частичную
-    # истину. Пометка обязана дойти до таблицы, иначе охранка бесполезна.
-    note() {
-        case "$1" in *'!'*) partial=1 ;; esac
-        echo "$1" | tr -d '!' | cut -d/ -f1
-    }
     for f in "$OUT/$env"-*.runid; do
         [ -f "$f" ] || continue
         tag=$(basename "$f" .runid)
         reps=$((reps + 1))
-        if [ -f "$OUT/$tag.INVALID" ]; then
-            invalid=$((invalid + 1))
+        # A run without usable truth cannot be scored: its denominator is
+        # unknown, so it is discarded rather than shown as an empty row.
+        # NOEND means the tracer was killed before its END block ran, so the
+        # liveness maps for that repetition do not exist.
+        if [ -f "$OUT/$tag.INVALID" ] || [ -f "$OUT/$tag.NOTRUTH" ] ||
+           [ -f "$OUT/$tag.NOEND" ]; then
+            bad=$((bad + 1))
             continue
         fi
         tr="$OUT/$tag.trace"; th="$OUT/$tag.truth"
+        # Without the trace every column would come out zero, which is exactly
+        # the silent failure this stand exists to detect. Refuse instead.
+        if [ ! -f "$tr" ]; then
+            echo "no trace for $tag: raw traces are not published, rerun the" >&2
+            echo "measurement to reproduce the numbers" >&2
+            exit 2
+        fi
         ro=$(recall_for "$tr" "$th" open)
         rw=$(recall_for "$tr" "$th" write)
         ru=$(recall_for "$tr" "$th" unlink)
         re=$(recall_for "$tr" "$th" exec)
-        case "$ro$rw$ru$re" in *'!'*) partial=1 ;; esac
-        o="$o$(echo "$ro" | tr -d '!' | cut -d/ -f1)
+        rc=$(recall_connect "$tr" "$th")
+        # The denominator comes from the workload, so it is compared against
+        # what the workload itself declared, not against a hardcoded ten. An
+        # environment that performs no actions at all is the negative control,
+        # not a partial run.
+        for r in "$ro" "$rw" "$ru" "$re" "$rc"; do
+            case "$r" in
+            ""|0/0) ;;
+            */"$OPS_PER_RUN") ;;
+            *) partial=1 ;;
+            esac
+        done
+        o="$o$(echo "$ro" | cut -d/ -f1)
 "
-        w="$w$(echo "$rw" | tr -d '!' | cut -d/ -f1)
+        w="$w$(echo "$rw" | cut -d/ -f1)
 "
-        u="$u$(echo "$ru" | tr -d '!' | cut -d/ -f1)
+        u="$u$(echo "$ru" | cut -d/ -f1)
 "
-        e="$e$(echo "$re" | tr -d '!' | cut -d/ -f1)
+        e="$e$(echo "$re" | cut -d/ -f1)
 "
-        c="$c$(grep -ca '^EVT .* connect ' "$tr" 2>/dev/null; true)
+        c="$c$(echo "$rc" | cut -d/ -f1)
 "
     done
-    [ "$reps" = "0" ] && continue
+
     label="$env"
-    [ "$invalid" != "0" ] && label="$label*"
+    [ "$bad" != "0" ] && label="$label*"
     [ "$partial" != "0" ] && label="$label!"
-    printf '%-18s %-10s %-9s %-9s %-9s %-9s %-9s\n' "$label" \
-        "$((reps - invalid))/$reps" \
+
+    if [ "$reps" = "0" ]; then
+        printf '%-18s %-9s %s\n' "$env" "0/0" "no runs"
+        continue
+    fi
+    printf '%-18s %-9s %-9s %-9s %-9s %-9s %-9s\n' "$label" \
+        "$((reps - bad))/$reps" \
         "$(echo "$o" | grep . | stats)" \
         "$(echo "$w" | grep . | stats)" \
         "$(echo "$u" | grep . | stats)" \
@@ -123,14 +145,16 @@ for env in $envs; do
 done
 
 echo
-echo "числа это количество различных токенов, дошедших до хоста, из десяти сделанных"
-echo "формат min/median/max по повторам; одно число означает совпадение по всем повторам"
-echo "звёздочка у имени среды: часть повторов признана негодной, см. файлы *.INVALID"
-echo "восклицательный знак: истина частичная, знаменатель меньше объявленного генератором"
-echo "read не инструментирован: аргумент вызова это дескриптор, а не путь"
+echo "numbers: distinct operations of that type whose marker reached the host, out of ten performed"
+echo "format min/median/max across repetitions; a single number means all repetitions agreed"
+echo "a token counts only when it appears in an event of its own operation type"
+echo "connect is matched by destination port, not by token"
+echo "* some repetitions discarded, see *.INVALID and *.NOTRUTH"
+echo "! numerator or denominator is not ten, see the run's .truth"
+echo "read is not instrumented: the syscall argument is a descriptor, not a path"
 
 n_invalid=$(ls "$OUT"/*.INVALID 2>/dev/null | wc -l)
 n_notruth=$(ls "$OUT"/*.NOTRUTH 2>/dev/null | wc -l)
 n_drops=$(grep -l . "$OUT"/*.drops 2>/dev/null | wc -l)
 echo
-echo "негодных повторов: $n_invalid, без истины: $n_notruth, с потерями или предупреждениями: $n_drops"
+echo "discarded: $n_invalid, no truth: $n_notruth, with drops or warnings: $n_drops"

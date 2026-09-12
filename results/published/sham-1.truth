@@ -1,0 +1,11 @@
+runid e2d5ded11789237207
+connect addr=172.16.77.1 base_port=27000
+start real=1789237209402454610 mono=16302990
+noop mode
+denom open attempted=0 succeeded=0
+denom write attempted=0 succeeded=0
+denom read attempted=0 succeeded=0
+denom connect attempted=0 succeeded=0
+denom exec attempted=0 succeeded=0
+denom unlink attempted=0 succeeded=0
+end real=1789237209402522210 mono=16371429

@@ -1,19 +1,16 @@
 #!/bin/bash
-# Первая рука: хост как положительный контроль, пустой прогон как отрицательный,
-# и три конфигурации gVisor, включая оверлей по умолчанию.
 set -u
 
 source "$(dirname "$0")/common.sh"
 
 if [ "$(id -u)" -ne 0 ]; then
-    echo "нужен root: sudo $0" >&2
+    echo "needs root: sudo $0" >&2
     exit 1
 fi
 
-REPS="${REPS:-5}"
-RUNSC="$S/bin/runsc"
-[ -x "$RUNSC" ] || RUNSC="${SVP_RUNSC:-}"
-[ -x "$RUNSC" ] || { echo "нет runsc" >&2; exit 1; }
+REPS="${REPS:-3}"
+RUNSC="${SVP_RUNSC:-$S/bin/runsc}"
+[ -x "$RUNSC" ] || { echo "runsc not found, set SVP_RUNSC in config.local" >&2; exit 1; }
 
 WORKROOT=/var/tmp/svp
 
@@ -24,14 +21,18 @@ cleanup_arm1() {
     unmount_apprun
     rm -rf "$WORKROOT"
 }
-trap cleanup_arm1 EXIT INT TERM
+trap cleanup_arm1 EXIT
+# Without the explicit exit, bash runs the handler and returns into the loop,
+# continuing the remaining repetitions with a killed tracer.
+trap 'cleanup_arm1; exit 130' INT TERM
 
-# Тот же tap и тот же адрес назначения, что и во второй руке.
+# Same tap and same destination as the VM arm, otherwise this arm would measure
+# loopback and the network column would not be comparable across rows.
 if tap_up; then
     DEST_IP="$HOST_IP"
 else
     DEST_IP=127.0.0.1
-    echo "внимание: tap не поднят, сетевая колонка этой руки несравнима с рукой ВМ" >&2
+    echo "warning: no tap, this arm's network column is not comparable to the VM arm" >&2
 fi
 
 prep_work() {
@@ -40,47 +41,41 @@ prep_work() {
     cp "$S/bin/gen" "$S/bin/svp-target" "$WORKROOT/"
 }
 
-# Нагрузка везде работает от uid 0 внутри своей среды. Иначе строки несравнимы:
-# runsc do даёт нагрузке root внутри песочницы, в виртуальной машине генератор
-# стартует как PID 1, и один только хост шёл бы от обычного пользователя. Исход
-# unlink в каталоге со sticky-битом, connect на привилегированный порт и execve
-# зависят от прав, то есть различие ушло бы прямо в измеряемые числа.
+# The workload runs as uid 0 inside its own environment everywhere: runsc do
+# gives it root in the sandbox and the VM guest is PID 1, so running the host row
+# unprivileged would push a privilege difference into the measured numbers.
 run_env() {
     local env=$1 runid=$2 tag=$3
+    local gen="cd $WORKROOT && SVP_RUNID=$runid ./gen /dev/stdout ./svp-target $BASE_PORT $DEST_IP"
+    local flags="--network=host --ignore-cgroups"
+
     case "$env" in
     host)
         ( cd "$WORKROOT" && SVP_RUNID="$runid" ./gen /dev/stdout ./svp-target "$BASE_PORT" "$DEST_IP" ) \
             > "$OUT/$tag.gen" 2>&1
         ;;
     sham)
-        # Та же песочница, тот же путь запуска, тот же идентификатор, ноль
-        # действий. Ненулевые маркеры здесь означают ошибку отбора, а не
-        # свойство среды.
-        "$RUNSC" --network=host --ignore-cgroups do -force-overlay=false \
+        "$RUNSC" $flags do -force-overlay=false \
             /bin/sh -c "cd $WORKROOT && SVP_NOOP=1 SVP_RUNID=$runid ./gen /dev/stdout ./svp-target $BASE_PORT $DEST_IP" \
             > "$OUT/$tag.gen" 2>&1
         ;;
     gvisor-overlay)
-        "$RUNSC" --network=host --ignore-cgroups do \
-            /bin/sh -c "cd $WORKROOT && SVP_RUNID=$runid ./gen /dev/stdout ./svp-target $BASE_PORT $DEST_IP" \
-            > "$OUT/$tag.gen" 2>&1
+        "$RUNSC" $flags do /bin/sh -c "$gen" > "$OUT/$tag.gen" 2>&1
         ;;
     gvisor-directfs)
-        "$RUNSC" --network=host --ignore-cgroups do -force-overlay=false \
-            /bin/sh -c "cd $WORKROOT && SVP_RUNID=$runid ./gen /dev/stdout ./svp-target $BASE_PORT $DEST_IP" \
-            > "$OUT/$tag.gen" 2>&1
+        "$RUNSC" $flags do -force-overlay=false /bin/sh -c "$gen" > "$OUT/$tag.gen" 2>&1
         ;;
     gvisor-gofer)
-        "$RUNSC" --network=host --ignore-cgroups --directfs=false do -force-overlay=false \
-            /bin/sh -c "cd $WORKROOT && SVP_RUNID=$runid ./gen /dev/stdout ./svp-target $BASE_PORT $DEST_IP" \
-            > "$OUT/$tag.gen" 2>&1
+        "$RUNSC" $flags --directfs=false do -force-overlay=false \
+            /bin/sh -c "$gen" > "$OUT/$tag.gen" 2>&1
         ;;
     esac
 }
 
+check_bpftrace_version
 write_manifest "host-and-gvisor"
-echo "адрес назначения: $DEST_IP"
-echo "прогонов на среду: $REPS"
+echo "destination: $DEST_IP"
+echo "repetitions per environment: $REPS"
 echo
 
 clear_envs host sham gvisor-overlay gvisor-directfs gvisor-gofer
@@ -104,34 +99,30 @@ for env in host sham gvisor-overlay gvisor-directfs gvisor-gofer; do
         stop_listeners
         echo "$runid" > "$OUT/$tag.runid"
 
-        # Истина пишется генератором в стандартный вывод и приезжает в .gen.
-        # Файл внутри песочницы не годится: в конфигурации gVisor с оверлеем по
-        # умолчанию он до хоста не доходит, и на его месте молча оказывался
-        # пустой файл, неотличимый от «гость ничего не сделал».
+        # Truth travels on stdout: a file written inside the sandbox never
+        # reaches the host under the default overlay, and an empty file is
+        # indistinguishable from an idle guest.
         grep -E '^(op=|denom |runid |connect |start |end |noop)' \
             "$OUT/$tag.gen" > "$OUT/$tag.truth" 2>/dev/null || true
-        if [ ! -s "$OUT/$tag.truth" ]; then
-            echo "истина недоступна" > "$OUT/$tag.NOTRUTH"
+        # Same completeness bar as the VM arm: a truncated truth would shrink
+        # the denominator and make recall look better than it is.
+        if [ "$(grep -c '^denom ' "$OUT/$tag.truth" 2>/dev/null; true)" != "$DENOM_LINES" ]; then
+            rm -f "$OUT/$tag.truth"
+            echo "truth incomplete or unavailable" > "$OUT/$tag.NOTRUTH"
         fi
 
-        probe=$(probe_seen "$tag" "$runid")
-        if [ "${probe:-0}" = "0" ]; then
-            echo "хостовая проба не видна: трассировщик недоказуем" > "$OUT/$tag.INVALID"
-            echo "    хостовая проба не попала в трейс: строку не использовать"
-        fi
+        check_host_probe "$tag" "$runid" || true
 
-        # grep -c при нуле совпадений печатает 0 и возвращает 1, поэтому
-        # прежнее || echo 0 дописывало второй ноль ровно на нулевых строках,
-        # то есть на отрицательном контроле.
-        # Хостовая проба носит тот же префикс и попадала бы в счётчик действий
-        # нагрузки, завышая его на четыре события в каждой строке.
+        # grep -c prints 0 and returns 1 on no match, so the count is taken
+        # without a || fallback. The host probe shares the run prefix and is
+        # subtracted here.
         mk=$(grep -a "^EVT .*SVP-$runid-" "$OUT/$tag.trace" 2>/dev/null | grep -vc 'hostprobe'; true)
         conn=$(grep -ca '^EVT .* connect ' "$OUT/$tag.trace" 2>/dev/null; true)
         all=$(grep -ca '^EVT ' "$OUT/$tag.trace" 2>/dev/null; true)
-        printf '  прогон %d: маркеров %s, connect %s, событий всего %s\n' \
+        printf '  run %d: markers %s, connect %s, events total %s\n' \
             "$r" "${mk:-0}" "${conn:-0}" "${all:-0}"
 
-        # У sham нулевые знаменатели это и есть его режим, а не отказ обвязки.
+        # sham has zero denominators by design, not by harness failure.
         [ "$env" = "sham" ] || check_denominators "$tag" "$OUT/$tag.gen"
         report_drops "$tag"
     done
@@ -139,4 +130,4 @@ for env in host sham gvisor-overlay gvisor-directfs gvisor-gofer; do
 done
 
 rm -rf "$WORKROOT"
-echo "готово, результаты в $OUT"
+echo "done, results in $OUT"

@@ -2,10 +2,14 @@
 # Восемьсот мегабайт, качаются скриптами, в истории им делать нечего.
 bin/
 
-# Результаты прогонов. Не публикуются намеренно: трейсы снимаются со всей
-# машины и содержат имена посторонних процессов. Сводная таблица есть в
-# RESULTS.md, её достаточно для проверки выводов.
-results/
+# Raw traces are not published: they are taken machine-wide and carry the names
+# of unrelated processes. Manifests, truth files and the summary are published
+# under results/published/ so the table can be audited.
+results/*
+!results/published/
+
+# Local paths, one per machine.
+config.local
 
 # Сборочный мусор и временное.
 *.o

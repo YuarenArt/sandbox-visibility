@@ -1,28 +1,53 @@
-# Общая часть запускалок. Подключается через source.
-
 S="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUT="$S/results"
-# Релизный bpftrace это AppImage поверх nix-бандла: прямой запуск монтирует себя
-# через FUSE и падает на отсутствующих путях /nix/store. Образ распакован один
-# раз, запускается его AppRun.
-BPFTRACE="$S/bin/squashfs-root/AppRun"
-[ -x "$BPFTRACE" ] || BPFTRACE="$S/bin/bpftrace-new"
-BASE_PORT=27000
 
-# Адрес назначения общий для всех сред. Иначе хост меряет loopback, а гость
-# виртуальной машины идёт через tap: два разных сетевых механизма в одной
-# колонке, и разность между строками нельзя приписать изоляции.
-TAP=svptap0
-HOST_IP=172.16.77.1
-GUEST_IP=172.16.77.2
+# sudo clears the environment, so operator paths are read from a file.
+[ -r "$S/config.local" ] && . "$S/config.local"
+
+# One directory per session. Overwriting in place once destroyed the artifacts
+# behind an already published table.
+OUT="${SVP_RUN_DIR:-$S/results/$(date -u +%Y%m%dT%H%M%SZ)}"
+
+# The release build is an AppImage over a nix bundle and has to be unpacked;
+# running it directly mounts itself over FUSE and fails on /nix/store paths.
+BPFTRACE="${SVP_BPFTRACE:-}"
+if [ -n "$BPFTRACE" ] && [ ! -x "$BPFTRACE" ]; then
+    echo "SVP_BPFTRACE points at something that is not executable: $BPFTRACE" >&2
+    exit 1
+fi
+[ -x "$BPFTRACE" ] || BPFTRACE="$S/bin/squashfs-root/AppRun"
+[ -x "$BPFTRACE" ] || BPFTRACE="$S/bin/bpftrace-new"
+[ -x "$BPFTRACE" ] || BPFTRACE="$(command -v bpftrace || true)"
+
+# trace.bt uses strncmp(), uptr() and args.* on syscall tracepoints; older
+# releases fail to compile it and the failure reads as "tracer died".
+check_bpftrace_version() {
+    local v major minor
+    v=$("$BPFTRACE" --version 2>&1 | grep -oE 'v[0-9]+\.[0-9]+' | head -1)
+    [ -n "$v" ] || { echo "cannot determine bpftrace version at $BPFTRACE" >&2; exit 1; }
+    major=${v#v}; major=${major%%.*}
+    minor=${v##*.}
+    if [ "$major" -eq 0 ] && [ "$minor" -lt 26 ]; then
+        echo "bpftrace $v at $BPFTRACE is too old, 0.26 or newer is required" >&2
+        echo "set SVP_BPFTRACE in config.local" >&2
+        exit 1
+    fi
+}
+BASE_PORT="${SVP_BASE_PORT:-27000}"
+
+# open, write, read, connect, exec, unlink
+DENOM_LINES=6
+
+TAP="${SVP_TAP:-svptap0}"
+HOST_IP="${SVP_HOST_IP:-172.16.77.1}"
+GUEST_IP="${SVP_GUEST_IP:-172.16.77.2}"
 
 tap_up() {
     if ip link show "$TAP" > /dev/null 2>&1; then
-        echo "интерфейс $TAP уже существует, не трогаю чужой" >&2
+        echo "$TAP already exists, refusing to touch an interface we do not own" >&2
         return 1
     fi
-    if ip route 2>/dev/null | grep -q '172\.16\.77\.'; then
-        echo "подсеть 172.16.77.0/24 уже занята на хосте" >&2
+    if ip route 2>/dev/null | grep -q "${HOST_IP%.*}\."; then
+        echo "${HOST_IP%.*}.0/24 is already routed on this host" >&2
         return 1
     fi
     ip tuntap add dev "$TAP" mode tap || return 1
@@ -33,8 +58,8 @@ tap_up() {
 }
 
 tap_down() {
-    # Удалять только то, что создали сами: безусловное удаление по имени
-    # снесло бы чужой интерфейс.
+    # Only remove what we created; deleting by name would take out someone
+    # else's interface.
     if [ "${TAP_OWNED:-0}" = "1" ]; then
         ip link del "$TAP" 2>/dev/null || true
         TAP_OWNED=0
@@ -42,23 +67,16 @@ tap_down() {
 }
 
 mkdir -p "$OUT"
+ln -sfn "$(basename "$OUT")" "$S/results/latest" 2>/dev/null || true
 
-# Рабочий каталог задаётся явно. Иначе он наследуется от вызывающего, а под
-# root это может быть каталог, недоступный ему самому (например FUSE-маунт
-# пользователя), и bpftrace падает на chdir ещё до привязки проб.
+# Explicit cd: the inherited cwd may be unreadable for root (a user FUSE mount),
+# and bpftrace then fails at chdir before attaching any probe.
 cd "$S" || exit 1
 
-# Инициализация до первого использования обязательна: обработчик выхода зовёт
-# stop_trace и stop_listeners в том числе при раннем выходе, когда ни один
-# трассировщик ещё не запускался, и под set -u это падало бы на несуществующей
-# переменной вместо уборки.
 TRACE_PID=""
 LISTENER_PIDS=""
 TAP_OWNED=0
 
-# Файлы прошлой сессии не перетираются целиком: перезапуск обновляет только то,
-# что успел создать, и рядом остаются артефакты другого прогона, снятые другой
-# версией обвязки. Сводка тогда считает вперемешку и выглядит полной.
 clear_envs() {
     local e
     for e in "$@"; do
@@ -66,24 +84,21 @@ clear_envs() {
               "$OUT/$e"-*.gen "$OUT/$e"-*.runid "$OUT/$e"-*.console \
               "$OUT/$e"-*.INVALID "$OUT/$e"-*.NOTRUTH "$OUT/$e"-*.NOEND \
               "$OUT/$e"-*.drops "$OUT/$e"-*.clock.begin "$OUT/$e"-*.clock.end \
-              "$OUT/$e"-*.debugfs "$OUT/$e"-*.e2fsck "$OUT/$e"-*.virtiofsd
+              "$OUT/$e"-*.debugfs "$OUT/$e"-*.e2fsck "$OUT/$e"-*.virtiofsd \
+              "$OUT/$e"-*.vmm
     done
 }
 
-# Идентификатор прогона: случайная часть плюс время. Голого времени мало,
-# по нему поиск в трейсе даёт ложные совпадения.
+# Random part plus time: a bare timestamp produces false matches in the trace.
 new_runid() {
     printf '%s%s' "$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')" "$(date +%s)"
 }
 
-# Слушатели нужны, чтобы connect действительно состоялся. В первом заходе сеть
-# мерилась при выключенной сети, то есть ноль был гарантирован до начала опыта.
 start_listeners() {
     LISTENER_PIDS=""
     local p
     for p in $(seq $BASE_PORT $((BASE_PORT + 9))); do
-        # Слушать на всех адресах: гость виртуальной машины приходит с адреса
-        # tap-интерфейса, а не на loopback.
+        # All addresses: a VM guest arrives from the tap address, not loopback.
         timeout 300 nc -l -k 0.0.0.0 "$p" > /dev/null 2>&1 &
         LISTENER_PIDS="$LISTENER_PIDS $!"
     done
@@ -95,25 +110,21 @@ stop_listeners() {
     for p in $LISTENER_PIDS; do
         kill "$p" 2>/dev/null || true
     done
-    # Ждать поимённо. Голый wait ждёт ВСЕ фоновые задания, включая живой
-    # трассировщик, и один незавершившийся процесс вешает прогон навсегда.
+    # Wait by pid: a bare wait would also wait for the live tracer.
     for p in $LISTENER_PIDS; do
         wait "$p" 2>/dev/null || true
     done
     LISTENER_PIDS=""
 }
 
-# Трассировщик поднимается до гостя и снимается после. Готовность определяется
-# по строке TRACE-READY, а не по sleep: в первом заходе окно наблюдения не
-# проверялось, и ноль мог означать просто опоздание.
 start_trace() {
     local tag=$1
     TRACE_OUT="$OUT/$tag.trace"
     TRACE_ERR="$OUT/$tag.trace.err"
     rm -f "$TRACE_OUT" "$TRACE_ERR"
-    # $$ внутри sh это pid, который унаследует bpftrace после exec. Он нужен
-    # программе, чтобы исключить собственный вывод из измерения.
     date +%s%N > "$OUT/$tag.clock.begin"
+    # $$ inside sh is the pid bpftrace inherits through exec; the program needs
+    # it to skip its own output.
     sh -c 'exec "$0" "$1" $$ "$2"' "$BPFTRACE" "$S/src/trace.bt" "$BASE_PORT" \
         > "$TRACE_OUT" 2> "$TRACE_ERR" &
     TRACE_PID=$!
@@ -123,17 +134,16 @@ start_trace() {
             return 0
         fi
         if ! kill -0 "$TRACE_PID" 2>/dev/null; then
-            echo "трассировщик умер, см. $TRACE_ERR" >&2
+            echo "tracer died, see $TRACE_ERR" >&2
             head -5 "$TRACE_ERR" >&2
             return 1
         fi
         sleep 0.1
         i=$((i + 1))
     done
-    # Без этого процесс остаётся жив, а следующий wait без аргументов ждёт его
-    # вечно: прогон замирает молча, а на машине висит root-трассировщик,
-    # прицепленный к raw_syscalls всей системы.
-    echo "трассировщик не сообщил о готовности за 30 с, убиваю" >&2
+    # Killing it here matters: otherwise it keeps running attached to
+    # raw_syscalls machine-wide and the next wait blocks forever.
+    echo "tracer did not report readiness within 30s, killing" >&2
     kill -KILL "$TRACE_PID" 2>/dev/null || true
     wait "$TRACE_PID" 2>/dev/null || true
     return 1
@@ -148,12 +158,9 @@ stop_trace() {
         sleep 0.1
         i=$((i + 1))
     done
-    # Если пришлось добивать, блок END не отработал и доказательство живости
-    # трассировщика потеряно. Это надо записать, а не молча получить строку без
-    # гистограмм.
     if kill -0 "$TRACE_PID" 2>/dev/null; then
         kill -KILL "$TRACE_PID" 2>/dev/null || true
-        echo "END не отработал, гистограммы отсутствуют" > "$OUT/$tag.NOEND"
+        echo "END block did not run, liveness maps missing" > "$OUT/$tag.NOEND"
     fi
     wait "$TRACE_PID" 2>/dev/null || true
     date +%s%N > "$OUT/$tag.clock.end"
@@ -161,10 +168,8 @@ stop_trace() {
     unmount_apprun
 }
 
-# Обёртка AppRun монтирует себе tmpfs при каждом запуске и снимает её только при
-# штатном завершении. Трассировщик глушится сигналом, поэтому монтирования
-# копились: за день их накопилось 132 штуки одно поверх другого, и в проводнике
-# это выглядит как десятки томов.
+# AppRun mounts a tmpfs per start and unmounts only on clean exit; the tracer is
+# killed by signal, so the mounts pile up.
 unmount_apprun() {
     local m="$S/bin/squashfs-root/mountroot"
     local i=0
@@ -174,74 +179,119 @@ unmount_apprun() {
     done
 }
 
-# Потери в кольцевом буфере и предупреждения самого bpftrace. Без этого ноль от
-# переполнения неотличим от ноля из-за границы песочницы, а WARNING про
-# несовпадение адресных пространств тихо обнуляет целую колонку. Предупреждения
-# идут в stdout, потери в stderr, поэтому смотреть надо оба потока, и результат
-# обязан оседать в файле, а не только в терминале.
 report_drops() {
     local tag=$1
     {
-        # bpftrace 0.26 печатает сводку как "Total lost event count: N" и шлёт
-        # её в stdout, а не в stderr. Прежний шаблон не совпадал никогда, то
-        # есть охранка от потерь была мертва.
         grep -hoE '(Lost [0-9]+ events|Total lost event count: [0-9]+)' \
             "$OUT/$tag.trace" "$OUT/$tag.trace.err" 2>/dev/null | tail -1
-        # Addrspace mismatch на пробе write отфильтрован осознанно: замером
-        # run/diag-write-probe.sh показано, что при этом предупреждении проба
-        # ловит все восемьдесят событий из восьмидесяти. Остальные WARNING
-        # остаются сигналом.
+        # Addrspace mismatch is filtered deliberately: run/diag-write-probe.sh
+        # shows the probe catches every event with it present. Other warnings
+        # stay a signal.
         grep -h 'WARNING' "$OUT/$tag.trace" "$OUT/$tag.trace.err" 2>/dev/null |
             grep -v 'Addrspace mismatch' | sort -u
     } > "$OUT/$tag.drops"
     if [ -s "$OUT/$tag.drops" ]; then
-        echo "  ВНИМАНИЕ: $(head -1 "$OUT/$tag.drops")"
+        echo "  WARNING: $(head -1 "$OUT/$tag.drops")"
     fi
 }
 
-# Заведомая операция на хосте внутри окна наблюдения. Без неё ноль в строке
-# неинтерпретируем: он одинаково означает и границу песочницы, и мёртвый
-# трассировщик. Токен отдельный (hostprobe), в подсчёт действий гостя не входит.
+# A known operation performed on the host inside the observation window. Without
+# it a zero is uninterpretable: it could mean either an isolating boundary or a
+# dead tracer. Called twice, before and after the workload, so that a tracer
+# dying mid-run is still caught. Its token carries the hostprobe suffix and is
+# subtracted from guest marker counts.
 host_probe() {
     local runid=$1
-    local p="/var/tmp/SVP-$runid-hostprobe.dat"
-    : > "$p"
-    rm -f "$p"
+    local d=/var/tmp
+    local f="$d/SVP-$runid-hostprobe.dat"
+    local b="$d/SVP-$runid-hostprobe.bin"
+
+    : > "$f"
+    # Payload must start with the marker: the write probe matches on a prefix.
+    printf 'SVP-%s-hostprobe-w\n' "$runid" > "$f"
+    if [ -x "$S/bin/svp-target" ]; then
+        cp "$S/bin/svp-target" "$b" 2>/dev/null && "$b" 2>/dev/null
+        rm -f "$b"
+    fi
+    rm -f "$f"
 }
 
-probe_seen() {
-    local tag=$1 runid=$2
-    grep -c "SVP-$runid-hostprobe" "$OUT/$tag.trace" 2>/dev/null; true
+# A zero in a column is only interpretable if the probe for that column is known
+# to have been alive in this very window, so the gate is per operation type
+# rather than a single non-zero count: three live probes and one dead one would
+# otherwise pass and turn the dead one's column into a finding. connect is not
+# in the list because the host probe issues no connect; its liveness rests on
+# the self-test and on the host row.
+PROBE_OPS="open write exec unlink"
+
+check_host_probe() {
+    local tag=$1 runid=$2 op seen="" missing=""
+
+    for op in $PROBE_OPS; do
+        if grep -qa " op=$op .*SVP-$runid-hostprobe" "$OUT/$tag.trace" 2>/dev/null; then
+            seen="$seen$op "
+        else
+            missing="$missing$op "
+        fi
+    done
+
+    {
+        echo "alive: ${seen:-none}"
+        echo "missing: ${missing:-none}"
+    } > "$OUT/$tag.probe"
+
+    if [ -n "$missing" ]; then
+        echo "host probe silent for: $missing" > "$OUT/$tag.INVALID"
+        echo "    host probe silent for: $missing discarding run"
+        return 1
+    fi
+    return 0
 }
 
-# Полнота считается от успешных операций. Если гость не смог выполнить операцию
-# ни разу, знаменатель нулевой, и строку нельзя подавать как измерение границы:
-# она измеряет отказ обвязки. Пометка кладётся файлом, а не печатается.
 check_denominators() {
     local tag=$1 src=$2
     [ -f "$src" ] || return 0
     local bad
     bad=$(grep '^denom ' "$src" 2>/dev/null | grep 'succeeded=0$' | cut -d' ' -f2 | tr '\n' ' ')
     if [ -n "$bad" ]; then
-        echo "нулевой знаменатель: $bad" > "$OUT/$tag.INVALID"
-        echo "  нулевой знаменатель у операций: $bad"
+        echo "zero denominator: $bad" > "$OUT/$tag.INVALID"
+        echo "  zero denominator for: $bad"
     fi
 }
 
-# Окружение решает числа, поэтому пишется рядом с ними. Без этого таблицу нельзя
-# воспроизвести и нельзя защитить.
+# Numbers are only as reproducible as the environment recorded next to them.
 write_manifest() {
     local name=$1
+    sha() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
     {
-        echo "дата: $(date -uIseconds)"
-        echo "ядро хоста: $(uname -srmo)"
-        echo "bpftrace: $("$BPFTRACE" --version 2>&1 | head -1) [$BPFTRACE]"
-        echo "bpftrace sha256: $(sha256sum "$BPFTRACE" 2>/dev/null | cut -d' ' -f1)"
-        echo "trace.bt sha256: $(sha256sum "$S/src/trace.bt" | cut -d' ' -f1)"
-        echo "gen sha256: $(sha256sum "$S/bin/gen" | cut -d' ' -f1)"
-        echo "vminit sha256: $(sha256sum "$S/bin/vminit" 2>/dev/null | cut -d' ' -f1)"
-        echo "REPS: ${REPS:-?}  BASE_PORT: $BASE_PORT"
-        echo "рука: $name"
+        echo "arm:          $name"
+        echo "date:         $(date -uIseconds)"
+        echo "commit:       $(git -C "$S" rev-parse --short HEAD 2>/dev/null || echo unknown)$([ -n "$(git -C "$S" status --porcelain 2>/dev/null)" ] && echo -dirty)"
+        echo "host kernel:  $(uname -srmo)"
+        echo "distro:       $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+        echo "cpu:          $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ //')"
+        echo "kvm:          $([ -r /dev/kvm ] && echo available || echo absent)"
+        echo "gcc:          $(gcc --version 2>/dev/null | head -1)"
+        echo "REPS:         ${REPS:-?}"
+        echo "base port:    $BASE_PORT"
+        echo "dest ip:      ${DEST_IP:-$HOST_IP}   tap: $TAP"
+        echo "bpftrace:     $("$BPFTRACE" --version 2>&1 | head -1) [$BPFTRACE]"
+        echo "  sha256:     $(sha "$BPFTRACE")"
+        echo "trace.bt:     $(sha "$S/src/trace.bt")"
+        echo "gen:          $(sha "$S/bin/gen")"
+        echo "vminit:       $(sha "$S/bin/vminit")"
+        echo "probecheck:   $(sha "$S/bin/probecheck")"
+        if [ -n "${RUNSC:-}" ] && [ -x "${RUNSC:-}" ]; then
+            echo "runsc:        $("$RUNSC" --version 2>&1 | head -1) [$RUNSC]"
+            echo "  sha256:     $(sha "$RUNSC")"
+        fi
+        if [ -n "${QEMU:-}" ] && [ -x "${QEMU:-}" ]; then
+            echo "qemu:         $("$QEMU" --version 2>&1 | head -1) [$QEMU]"
+            echo "virtiofsd:    $("${VIRTIOFSD:-/nonexistent}" --version 2>&1 | head -1)"
+            echo "firecracker:  $("${FC:-/nonexistent}" --version 2>&1 | head -1)"
+            echo "guest kernel: ${KERNEL_SRC:-}"
+            echo "  sha256:     $(sha "${KERNEL_SRC:-}")"
+        fi
     } > "$OUT/manifest-$name.txt"
     cat "$OUT/manifest-$name.txt"
 }

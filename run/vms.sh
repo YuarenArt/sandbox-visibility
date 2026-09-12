@@ -1,33 +1,39 @@
 #!/bin/bash
-# Вторая рука: виртуальные машины. qemu с общим каталогом через virtiofsd,
-# qemu с блочным корнем, firecracker с блочным корнем.
 set -u
 
 source "$(dirname "$0")/common.sh"
 
 if [ "$(id -u)" -ne 0 ]; then
-    echo "нужен root: sudo $0" >&2
+    echo "needs root: sudo $0" >&2
     exit 1
 fi
 
-REPS="${REPS:-5}"
-# Путь к распакованной сборке kata-static. Переопределяется переменной SVP_KATA.
+REPS="${REPS:-3}"
 KATA="${SVP_KATA:-$S/bin/kata/opt/kata}"
-KERNEL_SRC="$KATA/share/kata-containers/vmlinux-6.18.35-202"
-QEMU="$KATA/bin/qemu-system-x86_64"
-VIRTIOFSD="$KATA/libexec/virtiofsd"
-FC="$S/bin/firecracker"
+QEMU="${SVP_QEMU:-$KATA/bin/qemu-system-x86_64}"
+VIRTIOFSD="${SVP_VIRTIOFSD:-$KATA/libexec/virtiofsd}"
+FC="${SVP_FIRECRACKER:-$S/bin/firecracker}"
 VMWORK=/var/tmp/svp-vm
 
-[ -r "$KERNEL_SRC" ] || { echo "нет гостевого ядра: $KERNEL_SRC" >&2; exit 1; }
-[ -x "$QEMU" ] || QEMU=$(command -v qemu-system-x86_64)
+# Glob rather than a pinned patch version: any kata-static build works.
+KERNEL_SRC=$(ls "$KATA"/share/kata-containers/vmlinux-* 2>/dev/null |
+             grep -v debug | head -1)
 
-# Ключевая правка разбора: токен прогона зашит в имена, которые обязан открыть
-# сам монитор виртуальной машины. Тогда у строки, где ожидается ноль, появляется
-# собственное доказательство живости трассировщика. Ноль маркеров гостя при
-# наличии маркера образа означает границу; ноль и там, и там означает сломанную
-# обвязку. Различить эти два случая в первом заходе было нечем, а на них стояли
-# оба главных вывода.
+need() {
+    [ -x "$1" ] || [ -r "$1" ] || {
+        echo "missing $2: $1" >&2
+        echo "set SVP_KATA to an unpacked kata-static tree, see README" >&2
+        exit 1
+    }
+}
+[ -n "$KERNEL_SRC" ] || { echo "no guest kernel under $KATA/share/kata-containers" >&2; exit 1; }
+need "$KERNEL_SRC" "guest kernel"
+need "$QEMU" qemu
+need "$VIRTIOFSD" virtiofsd
+need "$FC" firecracker
+
+# The run id goes into the image and kernel filenames, which the VMM itself has
+# to open. That gives rows where zero is expected their own liveness evidence.
 build_images() {
     local runid=$1 shared=$2
     rm -rf "$VMWORK"
@@ -47,16 +53,14 @@ build_images() {
     fi
 }
 
-# Способ выключения у мониторов разный. qemu понимает тройную ошибку, а
-# firecracker её не поддерживает и остаётся висеть до таймаута уже после того,
-# как гость всё отработал.
+# qemu powers off on triple fault, firecracker does not.
 APPEND_QEMU="console=ttyS0 reboot=t panic=1 loglevel=4 init=/init"
 APPEND_FC="console=ttyS0 reboot=k panic=1 loglevel=4 init=/init"
 
-# qemu из бандла Kata собран без сетевого бэкенда user, а firecracker поддерживает
-# только tap. Один механизм на все строки обеих рук, иначе среды несравнимы по
-# сети. tap_up и tap_down живут в common.sh, их использует и первая рука.
 NET_ARGS="svp_addr=$HOST_IP svp_guestaddr=$GUEST_IP"
+
+# open, write, read, connect, exec, unlink
+DENOM_LINES=6
 
 run_qemu_block() {
     local runid=$1 tag=$2
@@ -80,7 +84,7 @@ run_qemu_virtiofs() {
     local vpid=$!
     sleep 0.6
     if ! kill -0 "$vpid" 2>/dev/null; then
-        echo "  virtiofsd не поднялся, см. $OUT/$tag.virtiofsd"
+        echo "  virtiofsd failed to start, see $OUT/$tag.virtiofsd"
         return 1
     fi
     timeout 300 "$QEMU" -M q35 -enable-kvm -cpu host -smp 2 -m 1024 \
@@ -97,9 +101,8 @@ run_qemu_virtiofs() {
         -L "$KATA/share/kata-qemu/qemu" \
         -display none -monitor none -no-reboot \
         -serial "file:$OUT/$tag.console" < /dev/null
-    # Код возврата надо снять сразу: раньше статусом функции становился статус
-    # завершающего kill, поэтому строка virtiofs печаталась с «кодом 0» даже
-    # когда qemu падал или упирался в таймаут.
+    # Capture the exit code immediately: otherwise the trailing kill becomes the
+    # function's status and a failed qemu reports success.
     local rc=$?
     kill "$vpid" 2>/dev/null || true
     wait "$vpid" 2>/dev/null || true
@@ -125,19 +128,15 @@ run_firecracker() {
   "machine-config": { "vcpu_count": 2, "mem_size_mib": 1024 }
 }
 EOF
-    # --api-sock вместе с --no-api заставляет firecracker поднять управляющий
-    # сокет и ждать команд вместо загрузки: снаружи это выглядит как зависание.
-    # Без timeout намеренно: под ним $! это pid обёртки, а SIGKILL обёртке
-    # дочернему процессу не передаётся. Из-за этого прогоны оставляли живые
-    # firecracker, державшие дескрипторы tap и удалённых образов. Ограничение по
-    # времени даёт цикл ожидания ниже.
+    # No timeout(1) wrapper: $! would be the wrapper and its SIGKILL never
+    # reaches firecracker, leaving a live VM holding the tap and a deleted image.
     "$FC" --no-api --config-file "$cfg" \
         > "$OUT/$tag.console" 2>&1 < /dev/null &
     local fpid=$!
 
-    # firecracker не гасится ни reboot=t, ни reboot=k: гость доходит до конца, а
-    # монитор висит до таймаута. Окно наблюдения тогда длиннее в шестьдесят раз,
-    # чем у соседних строк, и объём постороннего шума с ним несравним.
+    # firecracker ignores reboot=k, so wait for GUEST-DONE and kill it. Letting
+    # it run to a timeout would make this row's observation window sixty times
+    # longer than its neighbours', with incomparable background noise.
     local i=0
     while [ $i -lt 600 ]; do
         if grep -qa 'GUEST-DONE' "$OUT/$tag.console" 2>/dev/null; then
@@ -153,26 +152,17 @@ EOF
     grep -qa 'GUEST-DONE' "$OUT/$tag.console" 2>/dev/null
 }
 
+check_bpftrace_version
 write_manifest "vms"
-{
-    echo "qemu: $("$QEMU" --version 2>&1 | head -1) [$QEMU]"
-    echo "virtiofsd: $("$VIRTIOFSD" --version 2>&1 | head -1)"
-    echo "firecracker: $("$FC" --version 2>&1 | head -1)"
-    echo "гостевое ядро sha256: $(sha256sum "$KERNEL_SRC" | cut -d' ' -f1)"
-    echo "адрес назначения: $HOST_IP, гость: $GUEST_IP, tap: $TAP"
-} >> "$OUT/manifest-vms.txt"
 
-echo "прогонов на среду: $REPS"
-# Устройство поднимается перед каждым повтором, здесь только проверка, что имя
-# и подсеть свободны.
+echo "repetitions per environment: $REPS"
+# The device is recreated per repetition; this only checks the name and subnet
+# are free before starting.
 if tap_up; then
     tap_down
 else
-    echo "не удалось поднять $TAP, сетевые колонки будут пустыми" >&2
+    echo "could not bring up $TAP, network columns will be empty" >&2
 fi
-# Полная уборка на всех путях выхода. Прерванный прогон оставлял под /var/tmp
-# десятки мегабайт образов, живой трассировщик под root и слушателей на десяти
-# портах.
 cleanup_arm2() {
     stop_trace "cleanup" 2>/dev/null || true
     stop_listeners 2>/dev/null || true
@@ -180,7 +170,8 @@ cleanup_arm2() {
     unmount_apprun
     rm -rf "$VMWORK"
 }
-trap cleanup_arm2 EXIT INT TERM
+trap cleanup_arm2 EXIT
+trap 'cleanup_arm2; exit 130' INT TERM
 echo
 
 clear_envs qemu-block qemu-virtiofs firecracker-block
@@ -202,12 +193,12 @@ for env in qemu-block qemu-virtiofs firecracker-block; do
             continue
         fi
 
-        # Устройство пересоздаётся перед каждым повтором. qemu отпускает его
-        # штатно, а firecracker добивается сигналом, и следующий повтор упирался
-        # в «Resource busy»: два прогона из трёх пропадали.
+        # Recreate the tap per repetition: firecracker is killed by signal and
+        # leaves the device busy for the next run.
         tap_down
         if ! tap_up; then
-            echo "  повтор $r: tap не поднялся, пропускаю"
+            echo "  run $r: tap unavailable, skipping"
+            stop_trace "$tag"
             stop_listeners
             continue
         fi
@@ -225,55 +216,56 @@ for env in qemu-block qemu-virtiofs firecracker-block; do
         stop_trace "$tag"
         stop_listeners
 
-        # Истина читается из образа после выключения машины, то есть вне окна
-        # наблюдения и без участия хостовых данных: гостевая сторона никогда не
-        # выводится из хостовой.
+        # Truth is extracted after shutdown, outside the observation window: the
+        # guest side is never derived from host data.
         if [ "$env" = "qemu-virtiofs" ]; then
-            # При смонтированном общем каталоге гость работает на нём, и истина
-            # лежит прямо на хосте.
             cp "$VMWORK/shared/truth.txt" "$OUT/$tag.truth" 2>/dev/null || true
         else
-            # Журнал ext4 может быть не проигран, и свежая запись тогда не
-            # читается: без этого истина молча оказывается пустой.
+            # Replay the ext4 journal first, otherwise the freshly written truth
+            # file is not readable.
             e2fsck -p -f "$IMG" > "$OUT/$tag.e2fsck" 2>&1 || true
             debugfs -R "dump /work/truth.txt $OUT/$tag.truth" "$IMG" \
                 > "$OUT/$tag.debugfs" 2>&1
         fi
 
-        # Истина обязана содержать все шесть знаменателей. Иначе она частичная,
-        # и полнота, посчитанная от неё, выглядит лучше настоящей.
-        if [ "$(grep -c '^denom ' "$OUT/$tag.truth" 2>/dev/null; true)" != "6" ]; then
+        # Truth must carry a denominator for every operation type; a partial one
+        # would make recall look better than it is.
+        if [ "$(grep -c '^denom ' "$OUT/$tag.truth" 2>/dev/null; true)" != "$DENOM_LINES" ]; then
             rm -f "$OUT/$tag.truth"
-            echo "истина неполная или недоступна" > "$OUT/$tag.NOTRUTH"
+            echo "truth incomplete or unavailable" > "$OUT/$tag.NOTRUTH"
         fi
         echo "$runid" > "$OUT/$tag.runid"
 
-        # grep -c возвращает 1 при нуле совпадений, поэтому || echo дописывал
-        # второй ноль и ломал строку отчёта.
-        # Консоль последовательного порта содержит управляющие байты, поэтому -a.
+        # The serial console carries control bytes, hence -a.
         guest_ok=$(grep -ca 'GUEST-DONE' "$OUT/$tag.console" 2>/dev/null; true)
-        # Хостовая проба носит тот же префикс и попадала в счётчик действий
-        # гостя: при не загрузившемся госте это давало уверенные четыре маркера.
+        # The host probe shares the run prefix and is subtracted here.
         mk=$(grep -a "^EVT .*SVP-$runid-" "$OUT/$tag.trace" 2>/dev/null | grep -vc 'hostprobe'; true)
-        # Маркер образа засчитывается только от самого монитора. Иначе в него
-        # попадало эхо трассировщика, печатавшего ту же строку, и контроль
-        # живости удваивал сам себя.
-        # Имя вызова здесь open, openat или openat2: firecracker открывает образ
-        # устаревшим open, и шаблон, требовавший openat, обнулял контроль
-        # живости ровно в той строке, где он нужнее всего.
+        # Count the image marker only from the VMM's own comm, otherwise the
+        # tracer's echo of the same line counts itself. firecracker opens the
+        # image with legacy open(), hence open/openat/openat2.
         vmm=$(grep -cE "^EVT [0-9]+ (qemu|firecracker|fc_)[^ ]* [0-9]+ open(at2?)? .*(disk-SVP-$runid|vmlinux-SVP-$runid)" \
             "$OUT/$tag.trace" 2>/dev/null; true)
         guest_ok=${guest_ok:-0}; mk=${mk:-0}; vmm=${vmm:-0}
-        printf '  прогон %d: гость дошёл %s, маркеров гостя %s, маркеров образа %s (код %s)\n' \
+        echo "$vmm" > "$OUT/$tag.vmm"
+        share_ok=1
+        if [ "$env" = "qemu-virtiofs" ]; then
+            share_ok=$(grep -ca 'SHARE-MOUNTED' "$OUT/$tag.console" 2>/dev/null; true)
+            share_ok=${share_ok:-0}
+        fi
+        printf '  run %d: guest done %s, guest markers %s, image markers %s (rc %s)\n' \
             "$r" "$guest_ok" "$mk" "$vmm" "$vm_rc"
 
-        probe=$(probe_seen "$tag" "$runid")
-        if [ "${probe:-0}" = "0" ]; then
-            echo "хостовая проба не видна: трассировщик недоказуем" > "$OUT/$tag.INVALID"
-            echo "    хостовая проба не попала в трейс: строку не использовать"
+        if ! check_host_probe "$tag" "$runid"; then
+            :
         elif [ "$guest_ok" = "0" ]; then
-            echo "гость не дошёл до GUEST-DONE" > "$OUT/$tag.INVALID"
-            echo "    гость не дошёл до конца: строка не о границе, а об обвязке"
+            echo "guest never reached GUEST-DONE" > "$OUT/$tag.INVALID"
+            echo "    guest did not finish, this is about the harness, not the boundary"
+        elif [ "$share_ok" = "0" ]; then
+            echo "shared directory not mounted in the guest" > "$OUT/$tag.INVALID"
+            echo "    share not mounted: this would be a second block-root run"
+        elif [ "$mk" = "0" ] && [ "$vmm" = "0" ]; then
+            echo "zero with no in-row liveness evidence" > "$OUT/$tag.INVALID"
+            echo "    neither guest nor image markers: harness unproven, discarding run"
         fi
 
         check_denominators "$tag" "$OUT/$tag.truth"
@@ -283,4 +275,4 @@ for env in qemu-block qemu-virtiofs firecracker-block; do
 done
 
 rm -rf "$VMWORK"
-echo "готово, результаты в $OUT"
+echo "done, results in $OUT"

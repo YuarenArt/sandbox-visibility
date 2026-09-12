@@ -1,15 +1,6 @@
 /*
- * Генератор действий нагрузки. Работает внутри песочницы, в том числе как PID 1
- * в виртуальной машине, где идентификатор прогона берётся из /proc/cmdline.
- *
- * Каждая операция получает собственный токен, который попадает в аргумент
- * системного вызова. Токен не может возникнуть сам, поэтому по нему однозначно
- * решается, дожила операция до наблюдателя или нет. Полнота считается по типам
- * операций отдельно: общего числа «маркеров» здесь нет намеренно, в первом
- * заходе именно оно и оказалось суммой трёх колонок из пяти.
- *
- * В истину пишется исход с errno, а не факт попытки: операция, не прошедшая в
- * госте, не может быть увидена на хосте, и включать её в знаменатель нельзя.
+ * Workload generator. Runs inside the sandbox, including as PID 1 in a VM,
+ * where the run id comes from /proc/cmdline.
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -60,8 +51,6 @@ static void token(char *out, const char *op, int i)
 	snprintf(out, TOKLEN, "SVP-%s-%s-%03d", runid, op, i);
 }
 
-/* В виртуальной машине генератор стартует как PID 1 и получает параметры только
-   из командной строки ядра. */
 static int from_cmdline(const char *key, char *out, size_t len)
 {
 	char buf[4096], *p;
@@ -103,14 +92,9 @@ static void read_runid(void)
 }
 
 /*
- * В истину пишется тот токен, который реально стоит в аргументе вызова, а не
- * токен с именем операции. Иначе искать в трейсе будет нечего: open и unlink
- * работают с одним и тем же путём, и если для unlink записать отдельный токен,
- * его в аргументах не будет никогда, а колонка покажет уверенный ноль во всех
- * средах, включая положительный контроль.
- *
- * Различает операции сам наблюдатель по имени системного вызова, для этого
- * отдельный токен на операцию не нужен.
+ * Truth records the token that actually appears in the syscall argument, not a
+ * token named after the operation: open and unlink work on the same path, so a
+ * separate unlink token would never show up in any trace.
  */
 static void do_files(void)
 {
@@ -131,19 +115,17 @@ static void do_files(void)
 		token(wtok, "write", i);
 		snprintf(buf, sizeof(buf), "%s\n", wtok);
 		c_write.attempted++;
-		/* Завершающий ноль пишется намеренно: наблюдатель читает буфер
-		   строкой и без него дочитывает до чужих данных, засоряя трейс
-		   двоичным мусором. После этого grep считает файл двоичным и
-		   молча подавляет вывод, то есть анализатор выдаёт пустую
-		   таблицу, не сообщая причины. */
+		/* The trailing NUL is part of the payload: the tracer reads the
+		   buffer as a string and would otherwise copy adjacent memory
+		   into the trace. */
 		rc = write(fd, buf, strlen(buf) + 1);
 		record("write", wtok, rc, rc < 0 ? errno : 0);
 		if (rc > 0)
 			c_write.succeeded++;
 
-		/* Аргумент read это дескриптор, а не путь, поэтому по содержимому
-		   аргументов эта операция ненаблюдаема в принципе. Записывается,
-		   чтобы в таблице стояло «не инструментировано», а не ноль. */
+		/* read carries a descriptor, not a path: unobservable through
+		   syscall arguments, recorded so the column reads "not
+		   instrumented" rather than zero. */
 		lseek(fd, 0, SEEK_SET);
 		c_read.attempted++;
 		rc = read(fd, buf, sizeof(buf));
@@ -161,8 +143,8 @@ static void do_files(void)
 	}
 }
 
-/* Недостижимый адрес иначе вешает генератор на минуты повторов SYN, и одна
-   неверно настроенная среда парализует весь стенд. */
+/* An unreachable address would otherwise hang the generator for minutes of SYN
+   retries, so one misconfigured environment would stall the whole testbed. */
 static int connect_timeout(int s, struct sockaddr_in *sa)
 {
 	struct pollfd pfd;
@@ -200,12 +182,10 @@ done:
 }
 
 /*
- * Порт выводится из номера повторения, чтобы его можно было сопоставить с
- * конкретной операцией: аргумент connect не содержит текстового токена.
- *
- * Адрес назначения задаётся снаружи. В виртуальной машине 127.0.0.1 это
- * loopback самого гостя, и такое обращение до хоста не доходит вовсе, то есть
- * среды с зашитым loopback были бы несравнимы по построению.
+ * Destination port encodes the repetition index: connect() carries no text
+ * token, so the tracer identifies the operation by port. The address comes from
+ * outside because in a VM 127.0.0.1 is the guest's own loopback and never
+ * reaches the host, which would make the rows incomparable.
  */
 static void do_connect(int base_port, const char *addr)
 {
@@ -293,18 +273,15 @@ static void do_exec(const char *target)
 		} else {
 			record("exec", tok, -1, ECHILD);
 		}
-		/* Убирать за собой здесь нельзя: это дало бы ещё десять событий
-		   unlink с маркерами, не входящих ни в один знаменатель, и
-		   колонка unlink считала бы вдвое больше сделанного. Рабочий
-		   каталог всё равно пересоздаётся перед каждым повтором. */
+		/* Leave the copies behind: unlinking them would add exec-related
+		   unlink events that no denominator accounts for. */
 	}
 }
 
 static void report(const char *name, struct counters *c)
 {
-	/* Когда истина идёт в стандартный поток, это один и тот же поток:
-	   двойная печать дала бы по два знаменателя на операцию, и проверка
-	   полноты сочла бы истину частичной. */
+	/* Same stream when truth goes to stdout: printing twice would yield two
+	   denominators per operation. */
 	if (truth != stdout)
 		printf("denom %s attempted=%d succeeded=%d\n", name,
 		       c->attempted, c->succeeded);
@@ -318,8 +295,7 @@ int main(int argc, char **argv)
 	const char *exec_target = argc > 2 ? argv[2] : "/bin/svp-target";
 	int base_port = argc > 3 ? atoi(argv[3]) : 27000;
 	const char *addr = argc > 4 ? argv[4] : getenv("SVP_ADDR");
-	char receipt[256], addrbuf[64];
-	int fd;
+	char addrbuf[64];
 
 	read_runid();
 
@@ -331,10 +307,9 @@ int main(int argc, char **argv)
 	}
 
 	/*
-	 * На /dev/stdout нельзя открывать второй поток: получаются два FILE* с
-	 * разными буферами на одном дескрипторе, записи перемешиваются, и часть
-	 * строк истины теряется. Опасно это тем, что знаменатель молча
-	 * уменьшается, а полнота выглядит лучше настоящей.
+	 * Reuse the stdout FILE* instead of fopen("/dev/stdout"): two FILE* on
+	 * one fd interleave their buffers and silently drop truth lines, which
+	 * shrinks the denominator and makes recall look better than it is.
 	 */
 	if (strcmp(truth_path, "-") == 0 ||
 	    strcmp(truth_path, "/dev/stdout") == 0) {
@@ -348,8 +323,7 @@ int main(int argc, char **argv)
 	if (truth != stdout)
 		setvbuf(truth, NULL, _IOLBF, 0);
 
-	/* Когда истина идёт в стандартный вывод, это один и тот же поток, и
-	   заголовок печатать дважды нельзя. */
+
 	if (truth != stdout)
 		printf("runid %s\n", runid);
 	fprintf(truth, "runid %s\n", runid);
@@ -358,11 +332,8 @@ int main(int argc, char **argv)
 		now_ns(CLOCK_MONOTONIC));
 
 	/*
-	 * Пустой режим для отрицательного контроля. Среда, путь запуска и
-	 * идентификатор прогона те же, действий ноль. Прежний контроль был
-	 * sleep на хосте: песочница не запускалась, идентификатор не
-	 * передавался, и провалиться такая строка не могла в принципе, то есть
-	 * не проверяла ничего.
+	 * No-op mode for the negative control: same sandbox, same launch path,
+	 * same run id, zero actions.
 	 */
 	if (getenv("SVP_NOOP") == NULL) {
 		do_files();
@@ -374,28 +345,6 @@ int main(int argc, char **argv)
 		fprintf(truth, "noop mode\n");
 	}
 
-	/* Расписка намеренно не удаляется: она читается с хоста прямо из образа
-	   и отличает «хост не увидел» от «гость не сделал». */
-	/* В пустом режиме расписки быть не должно: отрицательный контроль давал
-	   три маркера вместо нуля именно на её открытии. */
-	if (getenv("SVP_NOOP") != NULL)
-		goto done;
-
-	snprintf(receipt, sizeof(receipt), "SVP-%s-receipt", runid);
-	fd = open(receipt, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-	if (fd >= 0) {
-		/* Содержимое намеренно начинается не с маркера: наблюдатель
-		   отбирает записи по префиксу, и расписка иначе попала бы в
-		   колонку write лишним одиннадцатым событием. Маркер несёт имя
-		   файла, этого достаточно для пробы на открытие. */
-		if (write(fd, "receipt ", 8) < 0 ||
-		    write(fd, receipt, strlen(receipt)) < 0 ||
-		    write(fd, "\n", 1) < 0)
-			perror("receipt");
-		close(fd);
-	}
-
-done:
 	report("open", &c_open);
 	report("write", &c_write);
 	report("read", &c_read);

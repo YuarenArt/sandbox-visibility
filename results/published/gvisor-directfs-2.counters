@@ -1,0 +1,13 @@
+TRACE-END nsecs=78313726479878
+@n_open: 76
+@n_write: 12
+@n_unlink: 14
+@n_exec: 2
+@n_connect: 10
+@n_sched_exec: 2
+liveness_events_total: 165051
+liveness_distinct_comms: 160
+write_family_total[writev]: 1125
+write_family_total[write]: 4344
+write_family_total[pwrite64]: 123
+write_family_total[pwritev2]: 117

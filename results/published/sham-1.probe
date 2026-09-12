@@ -1,0 +1,2 @@
+alive: open write exec unlink 
+missing: none

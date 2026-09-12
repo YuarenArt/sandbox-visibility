@@ -1,0 +1,20 @@
+env                runs      open      write     unlink    exec      connect  
+------------------------------------------------------------------------
+host               3/3       10        10        10        10        10       
+sham               3/3       no        no        no        no        0        
+gvisor-overlay     3/3       10        0         0         0         10       
+gvisor-directfs    3/3       10        10        10        0         10       
+gvisor-gofer       3/3       10        10        10        0         10       
+qemu-block         3/3       0         0         0         0         0        
+qemu-virtiofs      3/3       10        10        10        0         0        
+firecracker-block  3/3       0         0         0         0         0        
+
+numbers: distinct operations of that type whose marker reached the host, out of ten performed
+format min/median/max across repetitions; a single number means all repetitions agreed
+a token counts only when it appears in an event of its own operation type
+connect is matched by destination port, not by token
+* some repetitions discarded, see *.INVALID and *.NOTRUTH
+! numerator or denominator is not ten, see the run's .truth
+read is not instrumented: the syscall argument is a descriptor, not a path
+
+discarded: 0, no truth: 0, with drops or warnings: 0

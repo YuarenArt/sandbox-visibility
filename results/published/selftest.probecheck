@@ -1,0 +1,13 @@
+ISSUED open rc=3
+ISSUED openat rc=3
+ISSUED openat2 rc=4
+ISSUED write rc=29
+ISSUED pwritev rc=31
+ISSUED writev rc=30
+ISSUED pwrite64 rc=32
+ISSUED unlink rc=0
+ISSUED unlinkat rc=0
+ISSUED connect rc=0
+ISSUED execve rc=0
+ISSUED execveat rc=0
+PROBECHECK-DONE

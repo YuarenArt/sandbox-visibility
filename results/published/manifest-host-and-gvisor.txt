@@ -1,0 +1,19 @@
+arm:          host-and-gvisor
+date:         2026-09-12T18:19:54+00:00
+commit:       0606d74-dirty
+host kernel:  Linux 6.8.0-138-generic x86_64 GNU/Linux
+distro:       Ubuntu 22.04.5 LTS
+cpu:          13th Gen Intel(R) Core(TM) i7-13800H
+kvm:          available
+gcc:          gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
+REPS:         3
+base port:    27000
+dest ip:      172.16.77.1   tap: svptap0
+bpftrace:     bpftrace v0.26.0 [/home/yuaren/repos/sandbox-visibility/bin/squashfs-root/AppRun]
+  sha256:     7d97dc785f7e9ed35d980e4aca4dcd67c6e8cfe5a91bc4423385ecc02fbfd4ff
+trace.bt:     39c7da9afdeb4c938772096f95521dddc905f1dc65dd000d124ce35b52e80d2d
+gen:          b3dfc4a1c4932fd36844fe8c06af1273b967f2cfbcebd6dee4bfcf613bdccd24
+vminit:       736a30afe49f03d70011c2bd28c2820df3923ea292985c86890b9bb1418dab18
+probecheck:   6b013d4a6b321963f7005864c11187a84d165954b0e9689e96f15a5a6ec4a538
+runsc:        runsc version release-20260831.0 [/home/yuaren/repos/sandbox-visibility/bin/runsc]
+  sha256:     1a4995a70b3c8b7d36f55d7d2dc6d15185ebe420de653b1a330b42d36c0e6b4a

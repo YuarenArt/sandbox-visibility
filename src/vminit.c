@@ -1,10 +1,6 @@
 /*
- * PID 1 гостя виртуальной машины. Поднимает псевдо-ФС и сеть, запускает
- * генератор, печатает истину на последовательную консоль и выключает машину.
- *
- * Истина печатается на консоль намеренно: корень гостя может быть блочным
- * образом, который хост читает только посмертно, а сравнивать надо с тем, что
- * гость действительно сделал, а не с тем, что от него осталось.
+ * PID 1 of the VM guest: mounts the pseudo filesystems and the network, runs the
+ * generator, powers the machine off.
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -114,21 +110,24 @@ int main(void)
 	mkdir(WORK, 0700);
 
 	/*
-	 * Рабочий каталог обязан лежать на том хранилище, которое эта строка
-	 * измеряет. Без монтирования общего каталога строка virtiofs повторяла
-	 * бы опыт с блочным корнем при простаивающем virtiofsd, и вывод про
-	 * общий каталог делался бы без единой операции через общий каталог.
+	 * The working directory must live on the storage this row measures.
+	 * Falling back to the image would silently turn the shared-directory row
+	 * into a second block-root run.
 	 */
 	workdir = WORK;
 	if (cmdline_val("svp_share=", share, sizeof(share)) &&
 	    strcmp(share, "yes") == 0) {
 		mkdir(SHARE, 0700);
-		if (mount("svpshare", SHARE, "virtiofs", 0, NULL) == 0) {
-			workdir = SHARE;
-			printf("### SHARE-MOUNTED %s\n", SHARE);
-		} else {
+		if (mount("svpshare", SHARE, "virtiofs", 0, NULL) != 0) {
 			printf("### SHARE-MOUNT-FAILED errno=%d\n", errno);
+			printf("### GUEST-FAIL\n");
+			sync();
+			reboot(RB_POWER_OFF);
+			for (;;)
+				pause();
 		}
+		workdir = SHARE;
+		printf("### SHARE-MOUNTED %s\n", SHARE);
 	}
 
 	printf("### GUEST-START workdir=%s\n", workdir);
@@ -143,12 +142,9 @@ int main(void)
 	waitpid(pid, &status, 0);
 
 	/*
-	 * Истина намеренно НЕ выливается на консоль. Монитор виртуальной машины
-	 * пишет консоль на хост уже внутри окна наблюдения, и кусок такой записи
-	 * может начаться прямо с маркера, попав в колонку write. Это смешало бы
-	 * канал «собственная запись гостя» с каналом «вывод консоли», которые
-	 * стенд обязан разводить. Файл остаётся в образе, хост читает его после
-	 * выключения машины через debugfs, вне окна наблюдения.
+	 * Do not dump truth.txt to the console: the VMM writes the console inside
+	 * the observation window, and a chunk starting at a marker would count as
+	 * a guest write. The host reads the file from the image after shutdown.
 	 */
 	printf("### GUEST-DONE\n");
 

@@ -1,0 +1,27 @@
+# Copy to config.local and edit. Read by every script; sudo does not pass the
+# environment through, so paths belong here and not in your shell.
+
+# Unpacked kata-static tree. The scripts take the guest kernel, qemu and
+# virtiofsd from it.
+#   curl -LO https://github.com/kata-containers/kata-containers/releases/download/4.1.0/kata-static-4.1.0-amd64.tar.zst
+#   mkdir -p bin/kata && tar --zstd -xf kata-static-4.1.0-amd64.tar.zst -C bin/kata
+SVP_KATA="$S/bin/kata/opt/kata"
+
+# Overrides, only needed if the binaries live outside the kata tree.
+#SVP_QEMU=/usr/bin/qemu-system-x86_64
+#SVP_VIRTIOFSD=/usr/lib/qemu/virtiofsd
+
+# runsc from a gVisor release.
+SVP_RUNSC="$S/bin/runsc"
+
+# firecracker from a project release.
+SVP_FIRECRACKER="$S/bin/firecracker"
+
+# bpftrace 0.26 or newer. The release build is an AppImage over a nix bundle and
+# has to be unpacked: run ./bpftrace --appimage-extract inside bin/.
+#SVP_BPFTRACE="$S/bin/squashfs-root/AppRun"
+
+# Destination subnet for the guest network. Change it if 172.16.77.0/24 collides
+# with a VPN or a container bridge on this machine.
+#SVP_HOST_IP=172.16.77.1
+#SVP_GUEST_IP=172.16.77.2
