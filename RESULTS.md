@@ -13,7 +13,8 @@ in `*.counters`, summary in `summary.txt`, checksums of the lot in
 `PROVENANCE.txt`. The raw traces themselves are not published: they are taken
 machine-wide and carry the names of unrelated processes. `./publish.sh
 results/<session>` assembles that directory, so what is published is a function
-of a session rather than a hand-picked selection.
+of a session rather than a hand-picked selection, and the manifests name the
+commit the session ran on.
 
 Host: Linux 6.8.0-138-generic, x86-64. Observer: bpftrace 0.26.0 on syscall
 tracepoints. gVisor `release-20260831.0` driven through `runsc do`. Guest kernel
@@ -55,8 +56,8 @@ entry, not outcome: an event says the call was made with that argument, not that
 it succeeded.
 
 The zero is not the tracer sitting idle either. In the six block-row
-repetitions the unfiltered counter recorded between 104477 and 148473 syscalls
-inside the observation window, of which 4526 to 8372 were writes of the flavours
+repetitions the unfiltered counter recorded between 100821 and 140669 syscalls
+inside the observation window, of which 5360 to 6831 were writes of the flavours
 the probes cover; see `*.counters`. The marker columns are zero in the middle of
 that traffic, not instead of it.
 

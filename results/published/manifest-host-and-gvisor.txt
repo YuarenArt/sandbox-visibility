@@ -1,6 +1,6 @@
 arm:          host-and-gvisor
-date:         2026-09-12T18:19:54+00:00
-commit:       0606d74-dirty
+date:         2026-09-12T18:28:53+00:00
+commit:       951272a
 host kernel:  Linux 6.8.0-138-generic x86_64 GNU/Linux
 distro:       Ubuntu 22.04.5 LTS
 cpu:          13th Gen Intel(R) Core(TM) i7-13800H
